@@ -1,14 +1,20 @@
 import os
 import posixpath
-import http.server
-import urllib.request, urllib.parse, urllib.error
-import html
 import shutil
+import socket
+
+
 import mimetypes
 import re
 from io import BytesIO
-import socket
+import datetime
+
+import http.server
+import urllib
+import html
+
 import logging
+import urllib.parse
 
 
 logging.basicConfig(
@@ -20,23 +26,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+mimetypes.init()
+
+custom_mime_types = {
+    '': 'application/octet-stream',
+    '.py': 'text/plain',
+    '.c': 'text/plain',
+    '.h': 'text/plain',
+    '.md': 'text/markdown',
+    '.json': 'application/json',
+}
+
 class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
-
-    if not mimetypes.inited:
-        mimetypes.init()
-
     extensions_map = mimetypes.types_map.copy()
-    extensions_map.update({
-        '': 'application/octet-stream',
-        '.py': 'text/plain',
-        '.c': 'text/plain',
-        '.h': 'text/plain',
-    })
+    extensions_map.update(custom_mime_types)
 
     def __init__(self, *args, **kwargs):
         self.extensions_map = self.__class__.extensions_map
         super().__init__(*args, **kwargs)
-
 
     def do_GET(self):
         try:
@@ -49,7 +56,6 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             self.send_error(500, "Internal server error")
             logging.error(f'GET request failed: {self.path} from {self.client_address} | Error: {e}')
-
 
     def do_HEAD(self):
         try:
@@ -70,18 +76,70 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             logging.info(f'POST upload {status} from {client_ip} | Info: {info}')
             html_response = f"""
             <!DOCTYPE html>
-            <html>
-            <head><title>Upload Result</title></head>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <title>Upload Result</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <style>
+                    body {{
+                        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                        background-color: #f7f9fc;
+                        color: #333;
+                        margin: 0;
+                        padding: 0;
+                        display: flex;
+                        justify-content: center;
+                        align-items: center;
+                        height: 100vh;
+                    }}
+                    .card {{
+                        background: white;
+                        padding: 2rem 3rem;
+                        border-radius: 12px;
+                        box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+                        max-width: 500px;
+                        width: 100%;
+                        text-align: center;
+                    }}
+                    .card h2 {{
+                        margin-top: 0;
+                        color: #2d89ef;
+                    }}
+                    .status {{
+                        font-weight: bold;
+                        font-size: 1.2rem;
+                        margin: 1rem 0;
+                        color: {"green" if status == "Success" else "red"};
+                    }}
+                    .info {{
+                        margin-bottom: 1.5rem;
+                        word-wrap: break-word;
+                    }}
+                    a.button {{
+                        display: inline-block;
+                        padding: 0.6rem 1.2rem;
+                        background-color: #2d89ef;
+                        color: white;
+                        border-radius: 6px;
+                        text-decoration: none;
+                        transition: background-color 0.3s ease;
+                    }}
+                    a.button:hover {{
+                        background-color: #1e5fab;
+                    }}
+                </style>
+            </head>
             <body>
-                <h2>Upload Result</h2>
-                <hr>
-                <strong>{status}:</strong><br>
-                {info}<br>
-                <a href="{self.headers.get('referer', '/')}">Back</a>
+                <div class="card">
+                    <h2>Upload Result</h2>
+                    <div class="status">{status}</div>
+                    <div class="info">{html.escape(info)}</div>
+                    <a href="{self.headers.get('referer', '/')} " class="button">Back</a>
+                </div>
             </body>
             </html>
             """
-
             encoded = html_response.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-type", "text/html; charset=utf-8")
@@ -90,7 +148,8 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(encoded)
         except Exception as e:
             logging.error(f'POST upload failed from {self.client_address} | Error: {e}')
-            self.send_error(500, "Upload faild: Internal server error")
+            self.send_error(500, "Upload failed: Internal server error")
+
 
     def deal_post_data(self):
         content_type = self.headers.get('content-type', '')
@@ -110,7 +169,7 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         line = self.rfile.readline()
         remainbytes -= len(line)
         if not boundary in line:
-            logger.error("Content NOT begin with boundary")
+            logger.error("Countent NOT begin with boundary")
             return False, "Content NOT begin with boundary"
         
         line = self.rfile.readline()
@@ -130,10 +189,10 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         remainbytes -= len(line)
         line = self.rfile.readline()
         remainbytes -= len(line)
-        
+
         try:
             with open(file_path, 'wb') as out:
-                logger.info(f"Saving file to {file_path}")
+                logger.info(f'Saving file to {file_path}')
 
                 preline = self.rfile.readline()
                 remainbytes -= len(preline)
@@ -192,19 +251,19 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
             self.end_headers()
 
-            logger.info(f"Serving file: {path} | Size: {fs.st_size} bytes")
+            logger.info(f"Saving file: {path} | Size: {fs.st_size} bytes")
             return f
         
         except IOError as e:
             self.send_error(404, "File not found")
-            logger.error(f"File not found: {path} | Error: {str(e)}")
+            logger.error(f"File not found {path} | Error: {str(e)}")
             return None
         
         except Exception as e:
-            self.send_error(500, "Internal server error")
+            self.send_error(500, "Internal server  error")
             logger.exception(f"Unexpected error in send_head() for path: {path}")
             return None
-
+        
     def list_directory(self, path):
         try:
             entries = os.listdir(path)
@@ -218,29 +277,128 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
 
         f = BytesIO()
         f.write(b'<!DOCTYPE html>\n')
-        f.write(f"<html><head><title>Directory listing for {displaypath}</title></head>".encode())
-        f.write(f"<body><h2>Directory listing for {displaypath}</h2><hr>".encode())
+        f.write(f"""<html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <title>Directory listing for {displaypath}</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                body {{
+                    font-family: 'Segoe UI', Tahoma, sans-serif;
+                    background: #f0f2f5;
+                    margin: 0;
+                    padding: 2rem;
+                    color: #333;
+                }}
+                .container {{
+                    max-width: 800px;
+                    margin: auto;
+                    background: white;
+                    padding: 2rem;
+                    border-radius: 10px;
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+                }}
+                h2 {{
+                    color: #2c3e50;
+                }}
+                hr {{
+                    margin: 1.5rem 0;
+                }}
+                ul {{
+                    list-style: none;
+                    padding: 0;
+                }}
+                li {{
+                    margin: 0.5rem 0;
+                }}
+                a {{
+                    text-decoration: none;
+                    color: #3498db;
+                }}
+                a:hover {{
+                    text-decoration: underline;
+                }}
+                .upload-form {{
+                    margin-bottom: 1.5rem;
+                }}
+                .file-input {{
+                    margin-top: 0.5rem;
+                    display: block;
+                }}
+                .upload-button {{
+                    margin-top: 1rem;
+                    background: #3498db;
+                    color: white;
+                    border: none;
+                    padding: 0.5rem 1rem;
+                    border-radius: 5px;
+                    cursor: pointer;
+                }}
+                .upload-button:hover {{
+                    background: #2980b9;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h2>📁 Directory listing for <code>{displaypath}</code></h2>
+                <form class="upload-form" enctype="multipart/form-data" method="post">
+                    <label>Select a file to upload:</label>
+                    <input name="file" type="file" class="file-input"/>
+                    <input type="submit" value="Upload" class="upload-button"/>
+                </form>
+                <hr>
+                <ul>
+        """.encode())
+        f.write(b"""</ul>
+            <hr>
+            <p style="font-size: 0.9rem; color: #888;">Python Directory Server</p>
+        </div>
+        </body>
+        </html>""")
 
-        f.write(b"""
-            <form ENCTYPE="multipart/form-data" method="post">
-                <input name="file" type="file"/>
-                <input type="submit" value="Upload"/>
-            </form><hr><ul>
-        """)
+       
 
         for name in entries:
             fullname = os.path.join(path, name)
             displayname = linkname = name
+            icon = "📄" 
 
             if os.path.isdir(fullname):
                 displayname += "/"
                 linkname += "/"
+                icon = "📁"
 
             if os.path.islink(fullname):
                 displayname += "@"
+                icon = "🔗"
 
-            f.write(f'<li><a href="{urllib.parse.quote(linkname)}">{html.escape(displayname)}</a></li>\n'.encode())
+            try:
+                stat = os.stat(fullname)
+                size = stat.st_size
+                mtime = datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')
+            except Exception:
+                size = 0
+                mtime = "N/A"
 
+     
+            if size < 1024:
+                size_str = f"{size} B"
+            elif size < 1024 ** 2:
+                size_str = f"{size / 1024:.1f} KB"
+            else:
+                size_str = f"{size / (1024 ** 2):.1f} MB"
+
+
+            f.write(f'''
+                <li>
+                    <span style="margin-right: 8px;">{icon}</span>
+                    <a href="{urllib.parse.quote(linkname)}">{html.escape(displayname)}</a>
+                    <span style="float: right; font-size: 0.9em; color: #666;">
+                        {size_str} &nbsp;|&nbsp; {mtime}
+                    </span>
+                </li>
+            '''.encode())
         f.write(b"</ul><hr></body></html>")
         length = f.tell()
         f.seek(0)
@@ -262,12 +420,11 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             parts = [p for p in path.split('/') if p not in ('', '.', '..')]
 
             base_path = os.getcwd()
-            for part in parts:
+            for part in  parts:
                 base_path = os.path.join(base_path, part)
 
             logger.info(f"Translated URL path '{self.path}' -> local path '{base_path}'")
             return base_path
-        
         except Exception as e:
             logger.exception(f"Error while translating path: {path}")
             return os.getcwd()
