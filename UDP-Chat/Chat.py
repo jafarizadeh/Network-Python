@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""A more robust UDP chat application (client & server in one file).
+"""A more robust UDP chat application (client & server in one file) with proper
+logging support (console + rotating file log).
 
-Improvements over the original script:
-  • uses argparse for clean CLI handling
-  • separates concerns via Server & Client classes
-  • JSON‑based message protocol with explicit **type** fields
-  • proper logging & graceful shutdown (no os._exit!)
-  • thread‑safe queues + Event objects for clean thread termination
-  • gets a real LAN IP instead of hard‑coding 127.0.0.1 in most cases
-  • avoids WinError 10048 by allowing SO_REUSEADDR and exposing the port as an argument
+Run as server:
+    python udp_chat.py server --port 5000
+
+Run as client:
+    python udp_chat.py client <SERVER_IP> --port 5000
+
+Key features:
+  • argparse CLI
+  • JSON‑based protocol {type: join|msg|quit}
+  • logging module (INFO level to console + rotating file)
+  • graceful shutdown with threading.Event
+  • SO_REUSEADDR to avoid “address already in use”
 """
 from __future__ import annotations
 
@@ -21,20 +26,48 @@ import sys
 import threading
 from dataclasses import dataclass
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from typing import Dict, Tuple
+import logging
 
-BUF_SIZE = 1024  # bytes
+###############################################################################
+# Logging configuration
+###############################################################################
+
+def configure_logging() -> logging.Logger:
+    logger = logging.getLogger("udpchat")
+    logger.setLevel(logging.INFO)
+
+    # Console handler --------------------------------------------------------
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+
+    # File handler with rotation --------------------------------------------
+    fh = RotatingFileHandler("udp_chat.log", maxBytes=1_048_576, backupCount=3)
+    fh.setLevel(logging.INFO)
+
+    fmt = logging.Formatter("[%(asctime)s] %(levelname)-8s %(message)s", "%H:%M:%S")
+    ch.setFormatter(fmt)
+    fh.setFormatter(fmt)
+
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+    return logger
+
+LOG = configure_logging()
+
+###############################################################################
+# Constants & helpers
+###############################################################################
+
+BUF_SIZE = 1024
 DEFAULT_PORT = 5000
 
-###############################################################################
-# Helper utilities
-###############################################################################
 
 def get_local_ip() -> str:
-    """Return the best‑guess LAN IP of this machine (e.g. 192.168.x.x)."""
+    """Return best‑guess LAN IP (falls back to 127.0.0.1)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # We don’t need to reach 8.8.8.8 – connect() just selects the interface.
         s.connect(("8.8.8.8", 80))
         return s.getsockname()[0]
     except OSError:
@@ -42,29 +75,13 @@ def get_local_ip() -> str:
     finally:
         s.close()
 
-
-def now() -> str:
-    """Current time (HH:MM:SS) for log messages."""
-    return datetime.now().strftime("%H:%M:%S")
-
-
-def log(msg: str) -> None:
-    print(f"[{now()}] {msg}")
-
 ###############################################################################
 # Message protocol helpers
 ###############################################################################
 
-def make_join(name: str) -> bytes:
-    return json.dumps({"type": "join", "name": name}).encode()
-
-
-def make_msg(name: str, text: str) -> bytes:
-    return json.dumps({"type": "msg", "name": name, "text": text}).encode()
-
-
-def make_quit(name: str) -> bytes:
-    return json.dumps({"type": "quit", "name": name}).encode()
+def make_packet(ptype: str, **payload) -> bytes:
+    payload["type"] = ptype
+    return json.dumps(payload).encode()
 
 
 def parse_packet(data: bytes) -> dict:
@@ -90,73 +107,72 @@ class UDPChatServer:
 
         self.clients: Dict[Tuple[str, int], ClientInfo] = {}
         self.recv_q: "queue.Queue[Tuple[bytes, Tuple[str, int]]]" = queue.Queue()
-        self._running = threading.Event()
-        self._running.set()
+        self.running = threading.Event()
+        self.running.set()
 
-    # -------------------------- public API ----------------------------------
+    # ---------------------------------------------------------------------
     def start(self) -> None:
-        log(f"Server listening on {self.host}:{self.port}")
+        LOG.info("Server listening on %s:%d", self.host, self.port)
         threading.Thread(target=self._recv_loop, daemon=True).start()
         try:
             self._process_loop()
         except KeyboardInterrupt:
-            log("Shutting down server …")
+            LOG.info("KeyboardInterrupt → shutting down server")
         finally:
+            self.running.clear()
             self.sock.close()
 
-    # ------------------------ internal helpers ------------------------------
+    # ---------------------------------------------------------------------
     def _recv_loop(self) -> None:
-        while self._running.is_set():
+        while self.running.is_set():
             try:
                 data, addr = self.sock.recvfrom(BUF_SIZE)
                 self.recv_q.put((data, addr))
             except OSError:
-                break  # socket closed
+                break
 
-    def _broadcast(self, data: bytes, exclude: Tuple[str, int] | None = None) -> None:
+    def _broadcast(self, data: bytes, exclude: Tuple[str, int] | None = None):
         for addr in list(self.clients.keys()):
             if addr == exclude:
                 continue
             try:
                 self.sock.sendto(data, addr)
             except OSError:
-                # client unreachable → drop it
+                LOG.warning("Failed to send to %s – removing from client list", addr)
                 self.clients.pop(addr, None)
 
-    def _process_loop(self) -> None:
-        while self._running.is_set():
+    def _process_loop(self):
+        while self.running.is_set():
             try:
                 data, addr = self.recv_q.get(timeout=0.5)
             except queue.Empty:
                 continue
-
             try:
                 pkt = parse_packet(data)
             except json.JSONDecodeError:
-                log(f"Malformed packet from {addr}: {data!r}")
+                LOG.warning("Malformed packet from %s", addr)
                 continue
 
             ptype = pkt.get("type")
             if ptype == "join":
-                name = pkt["name"]
+                name = pkt.get("name", "?")
                 self.clients[addr] = ClientInfo(addr, name)
-                log(f"{name} joined from {addr}")
-                self._broadcast(make_msg("System", f"{name} joined the chat"))
+                LOG.info("%s joined from %s", name, addr)
+                self._broadcast(make_packet("msg", name="System", text=f"{name} joined the chat"))
 
             elif ptype == "msg":
-                if addr not in self.clients:
-                    # ignore unknown client messages
+                client = self.clients.get(addr)
+                if not client:
+                    LOG.warning("Unknown client %s tried to send a message", addr)
                     continue
-                name = self.clients[addr].name
-                text = pkt.get("text", "")
-                log(f"<{name}> {text}")
-                self._broadcast(make_msg(name, text), exclude=addr)
+                LOG.info("<%s> %s", client.name, pkt.get("text", ""))
+                self._broadcast(data, exclude=addr)
 
             elif ptype == "quit":
                 client = self.clients.pop(addr, None)
                 if client:
-                    log(f"{client.name} left the chat")
-                    self._broadcast(make_msg("System", f"{client.name} left the chat"), exclude=addr)
+                    LOG.info("%s left the chat", client.name)
+                    self._broadcast(make_packet("msg", name="System", text=f"{client.name} left the chat"))
 
 ###############################################################################
 # Client implementation
@@ -171,73 +187,70 @@ class UDPChatClient:
         local_host = get_local_ip()
         local_port = random.randint(6000, 10000)
         self.sock.bind((local_host, local_port))
-        log(f"Client bound on {local_host}:{local_port}")
+        LOG.info("Client bound on %s:%d", local_host, local_port)
 
-        self._running = threading.Event()
-        self._running.set()
+        self.running = threading.Event()
+        self.running.set()
 
-    # -------------------------- public API ----------------------------------
-    def start(self) -> None:
+    # ------------------------------------------------------------------
+    def start(self):
         name = input("Your name: ").strip() or f"Guest{random.randint(1000, 9999)}"
-        log(f"Welcome, {name}!")
-        self.sock.sendto(make_join(name), self.server)
+        LOG.info("Welcome, %s", name)
+        self.sock.sendto(make_packet("join", name=name), self.server)
 
         threading.Thread(target=self._recv_loop, daemon=True).start()
+
         try:
-            while self._running.is_set():
+            while self.running.is_set():
                 try:
                     text = input()
                 except EOFError:
                     break
                 if text.lower() in {"/quit", "qqq"}:
-                    self.sock.sendto(make_quit(name), self.server)
+                    self.sock.sendto(make_packet("quit", name=name), self.server)
                     break
                 if text.strip():
-                    self.sock.sendto(make_msg(name, text), self.server)
+                    self.sock.sendto(make_packet("msg", name=name, text=text), self.server)
         except KeyboardInterrupt:
             pass
         finally:
-            self._running.clear()
+            self.running.clear()
             self.sock.close()
-            log("Disconnected.")
+            LOG.info("Disconnected.")
 
-    # ------------------------ internal helpers ------------------------------
-    def _recv_loop(self) -> None:
-        while self._running.is_set():
+    # ------------------------------------------------------------------
+    def _recv_loop(self):
+        while self.running.is_set():
             try:
                 data, _ = self.sock.recvfrom(BUF_SIZE)
                 pkt = parse_packet(data)
-                ptype = pkt.get("type")
-                if ptype == "msg":
+                if pkt.get("type") == "msg":
                     print(f"\r<{pkt['name']}> {pkt['text']}")
-                    print("> ", end="", flush=True)  # prompt again
+                    print("> ", end="", flush=True)
             except (OSError, json.JSONDecodeError):
                 break
 
 ###############################################################################
-# CLI handling
+# CLI entry point
 ###############################################################################
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="UDP Chat (client & server)")
+def main():
+    parser = argparse.ArgumentParser(description="UDP chat application")
     sub = parser.add_subparsers(dest="mode", required=True)
 
-    srv = sub.add_parser("server", help="run as chat server")
+    srv = sub.add_parser("server", help="run as server")
     srv.add_argument("--port", type=int, default=DEFAULT_PORT, help="UDP port to listen on")
 
-    cli = sub.add_parser("client", help="run as chat client")
+    cli = sub.add_parser("client", help="run as client")
     cli.add_argument("server_ip", help="IP address of chat server")
     cli.add_argument("--port", type=int, default=DEFAULT_PORT, help="UDP port of server")
 
     args = parser.parse_args()
 
     if args.mode == "server":
-        host = get_local_ip()
-        UDPChatServer(host, args.port).start()
+        UDPChatServer(get_local_ip(), args.port).start()
     elif args.mode == "client":
         UDPChatClient(args.server_ip, args.port).start()
-    else:
-        parser.error("Unknown mode")
 
 
 if __name__ == "__main__":
