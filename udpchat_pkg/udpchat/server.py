@@ -20,6 +20,7 @@ from .protocol import (
     QUIT, ROOM_MSG, SYSTEM_MSG, ClientInfo, make_packet, parse_packet,
 )
 from .util import LOG, get_local_ip
+from .packet_spec import EXPECTED_FIELDS_BY_TYPE
 
 
 class UDPChatServer:
@@ -91,6 +92,13 @@ class UDPChatServer:
             members.discard(addr)
         LOG.info("%s left the chat", client.name)
 
+    def _validate_packet(self, pkt: dict) -> bool:
+        """Check if a packet contains all required keys for its declared type."""
+        ptype = pkt.get("type")
+        expected = EXPECTED_FIELDS_BY_TYPE.get(ptype)
+        if not expected:
+            return False
+        return expected.issubset(pkt.keys())
     # ---------------------------------------------------------------- main loop
     def _process_loop(self) -> None:
         """Single‑threaded *router* – dequeue datagrams and dispatch by type."""
@@ -103,6 +111,10 @@ class UDPChatServer:
             try:
                 pkt = parse_packet(data)
             except json.JSONDecodeError:                   # Ignore garbage
+                continue
+
+            if not self._validate_packet(pkt):
+                LOG.warning("Dropped malformed packet: %s", pkt)
                 continue
 
             ptype = pkt.get("type")                       # Packet discriminator

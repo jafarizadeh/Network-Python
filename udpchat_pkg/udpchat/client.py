@@ -115,13 +115,27 @@ class UDPChatClient:
 
     # ---------------------------------------------------------------- networking
     def _send(self, pkt: bytes) -> None:
-        """Thin wrapper around sock.sendto() with basic error handling."""
         try:
+            parsed = parse_packet(pkt)
+            if not self._validate_packet(parsed):
+                LOG.warning("Refused to send malformed packet: %s", parsed)
+                return
             self.sock.sendto(pkt, self.server)
         except OSError as exc:
             LOG.error("Send failed: %s", exc)
             self.running.clear()
 
+    def _validate_packet(self, pkt: dict) -> bool:
+        """
+        Ensures that a packet contains all required fields for its declared type.
+        This mirrors the validation logic used by the server.
+        """
+        ptype = pkt.get("type")
+        expected = EXPECTED_FIELDS_BY_TYPE.get(ptype)
+        if not expected:
+            return False
+        return expected.issubset(pkt.keys())
+    
     # ---------------------------------------------------------------- receive loop
     def _recv_loop(self) -> None:
         """Background thread – prints inbound packets then redraws prompt."""
@@ -129,6 +143,11 @@ class UDPChatClient:
             try:
                 data, _ = self.sock.recvfrom(BUF_SIZE)     # Blocking recv
                 pkt = parse_packet(data)                   # bytes ⟶ dict
+
+                if not self._validate_packet(pkt):
+                    LOG.warning("Received malformed packet: %s", pkt)
+                    continue
+
             except (OSError, json.JSONDecodeError):        # Socket closed or garbled
                 break
 
