@@ -1,0 +1,12 @@
+setup.py
+udpchat/__init__.py
+udpchat/client.py
+udpchat/protocol.py
+udpchat/server.py
+udpchat/util.py
+udpchat.egg-info/PKG-INFO
+udpchat.egg-info/SOURCES.txt
+udpchat.egg-info/dependency_links.txt
+udpchat.egg-info/entry_points.txt
+udpchat.egg-info/requires.txt
+udpchat.egg-info/top_level.txt
