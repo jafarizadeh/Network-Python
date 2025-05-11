@@ -223,4 +223,28 @@ class UDPChatClient:
     def start(self) -> None:
         self.name = input("Your name: ").strip() or f"Guest{random.randint(1000, 9999)}"
         LOG.info("Welcome, %s", self.name)
-        
+        self._send(make_packet(JOIN, name=self.name))
+
+        threading.Thread(target=self._recv_loop, daemon=True).start()
+
+        try:
+            while self.running.is_set():
+                try:
+                    line = input(self._prompt())
+                except EOFError:
+                    break
+
+                if self.current_room and line.strip().lower() in {"exit", "end"}:
+                    self.current_room = None
+                    continue
+
+                if line.lower() in {"/quit", "qqq"}:
+                    self._send(make_packet(QUIT, name=self.name))
+                    break
+
+                if line.startswith("/"):
+                    self._handle_command(line)
+                    continue
+
+                if self.current_room:
+                    self._send(make_packet(ROOM_MSG, room = self.current_room, **{"from": self.name}, text=line))
