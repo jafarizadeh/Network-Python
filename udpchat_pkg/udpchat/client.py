@@ -1,39 +1,40 @@
 #!/usr/bin/env python3
-"""Command‑line UDP chat *client* supporting:
+"""
+Command-line UDP chat *client* supporting:
 
 * Public lobby
 * Private rooms (create / invite / accept)
-* Context‑aware prompt: "room# " while inside a room, plain "> " otherwise.
-* ANSI‑coloured output via *colorama*.
+* Context-aware prompt: "room# " while inside a room, plain "> " otherwise.
+* ANSI-coloured output via *colorama*.
 
 Usage (after installing package locally):
-
     python -m udpchat.client 203.0.113.22  # Connect to server's IP
 """
 
-from __future__ import annotations                # ↩ type hints forward refs OK
+from __future__ import annotations  # Enable postponed evaluation of type annotations
 
-import argparse                                    # For CLI parsing
-import json                                        # For packet decoding in listener
-import random                                      # Random guest name / port choice
-import shlex                                       # Robust command splitting
-import socket                                      # Low‑level UDP API
-import threading                                   # Background listener thread
-from typing import Optional, Set, Tuple            # Typing aids
-import sys                                         # Needed for prompt redraw
+# --- Standard library imports ---
+import argparse              # For command-line argument parsing
+import json                  # For decoding/encoding JSON packets
+import random                # For random guest names / port selection
+import shlex                 # For safe command-line input splitting
+import socket                # For UDP socket communication
+import threading             # For background listener thread
+from typing import Optional, Set, Tuple  # Type hint support
+import sys                   # For terminal control (e.g., prompt redraw)
 
-# ---------- Shared protocol symbols / helpers ----------
-from .protocol import (
+# --- Local project imports ---
+from .packet_spec import EXPECTED_FIELDS_BY_TYPE  # Shared schema for packet validation
+from .protocol import (                          # Packet types and network constants
     ACCEPT_INV, BUF_SIZE, CREATE_ROOM, DEFAULT_PORT, INVITE, JOIN, PUBLIC_MSG,
     QUIT, ROOM_MSG, SYSTEM_MSG, make_packet, parse_packet,
 )
+from .util import LOG, get_local_ip             # Logging + local IP utility
 
-# ---------- Local utilities ----------
-from .util import LOG, get_local_ip
+# --- Third-party imports ---
+from colorama import Fore, Style, init           # For colored terminal output
+init(autoreset=True)                             # Reset styles automatically after each print
 
-# 3rd‑party: coloured terminal output (safe if absent – pip install colorama)
-from colorama import Fore, Style, init
-init(autoreset=True)                               # Reset colour after each print
 
 
 class UDPChatClient:
@@ -71,6 +72,7 @@ class UDPChatClient:
         # -------- greet & join lobby --------
         self.name = input("Your name: ").strip() or f"Guest{random.randint(1000,9999)}"
         LOG.info("Welcome, %s", self.name)
+        print("Type /help to see available commands.")
         self._send(make_packet(JOIN, name=self.name))
 
         # -------- spawn receiver thread --------
@@ -166,6 +168,7 @@ class UDPChatClient:
                 colour = Fore.YELLOW if room == self.current_room else Fore.BLUE
                 print(f"\r{colour}{tag}<{sender}>{Style.RESET_ALL} {text}")
             # Prompt re‑paint so the user's current input line isn't lost
+            print()
             sys.stdout.write(self._prompt())
             sys.stdout.flush()
 
@@ -221,7 +224,18 @@ class UDPChatClient:
                     print("You are not a member of that room")
                     return
                 self._send(make_packet(ROOM_MSG, room=room, **{"from": self.name}, text=msg_text))
+            
+            # ------------------------- /help ----------------------------------
+            case "/help":
+                print("\n   Available commands:")
+                print("     /create <room>       "  + Fore.GREEN + " - Create and join a private room" + Style.RESET_ALL)
+                print("     /invite <room> <user>"  + Fore.GREEN + " - Invite a user to a room" + Style.RESET_ALL)
+                print("     /accept <room>       "  + Fore.GREEN + " - Accept a room invitation" + Style.RESET_ALL)
+                print("     /room <room> <msg>   "  + Fore.GREEN + " - Send message to a room without switching context" + Style.RESET_ALL)
+                print("     /quit or qqq         "  + Fore.GREEN + " - Exit the chat client")
+                print("     exit or end          "  + Fore.GREEN + " - Leave the current room and return to lobby" + Style.RESET_ALL)
 
+            
             # ------------------------- unknown cmd ----------------------------
             case _:
                 print("Unknown command")

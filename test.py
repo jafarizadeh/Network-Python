@@ -221,7 +221,7 @@ class UDPChatClient:
         self.current_room: Optional[str] = None  # ≈ context for prompt & sends
 
     def start(self) -> None:
-        self.name = input("Your name: ").strip() or f"Guest{random.randint(1000, 9999)}"
+        self.name = input("Your name: ").strip() or f"Gueset{random.randint(1000, 9999)}"
         LOG.info("Welcome, %s", self.name)
         self._send(make_packet(JOIN, name=self.name))
 
@@ -238,7 +238,7 @@ class UDPChatClient:
                     self.current_room = None
                     continue
 
-                if line.lower() in {"/quit", "qqq"}:
+                if line.lower() in {"/quir", "qqq"}:
                     self._send(make_packet(QUIT, name=self.name))
                     break
 
@@ -247,4 +247,177 @@ class UDPChatClient:
                     continue
 
                 if self.current_room:
-                    self._send(make_packet(ROOM_MSG, room = self.current_room, **{"from": self.name}, text=line))
+                    self._send(make_packet(ROOM_MSG, room=self.current_room, **{"from": self.name}, text=line))
+                    continue
+
+                self._send(make_packet(PUBLIC_MSG, name=self.name, text=line))
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.running.clear()
+            self.sock.close()
+            LOG.info("Discounnected")
+
+        
+    def _send(self, pkt: bytes) -> None:
+        try:
+            self.sock.sendto(pkt, self.server)
+        except OSError as exc:
+            LOG.error ("Send failed: %s", exc)
+            self.running.clear()
+
+
+    def _recv_loop(self) -> None:
+        """Background thread – prints inbound packets then redraws prompt."""
+        while self.running.is_set():
+            try:
+                data, _ = self.sock.recvfrom(BUF_SIZE)     # Blocking recv
+                pkt = parse_packet(data)                   # bytes ⟶ dict
+
+                if not self._validate_packet(pkt):
+                    LOG.warning("Received malformed packet: %s", pkt)
+                    continue
+
+            except (OSError, json.JSONDecodeError):        # Socket closed or garbled
+                break
+
+            ptype = pkt.get("type")                        # Discriminator
+            if ptype == SYSTEM_MSG:                        # Informational/error
+                print(f"\r{Fore.CYAN}[SYSTEM]{Style.RESET_ALL} {pkt['text']}")
+            elif ptype == PUBLIC_MSG:                      # Lobby broadcast
+                print(f"\r{Fore.GREEN}<{pkt['name']}>{Style.RESET_ALL} {pkt['text']}")
+            elif ptype == INVITE:                          # Room invitation
+                room = pkt["room"]; inviter = pkt["from"]
+                self.pending_inv.add(room)
+                print(f"\r{Fore.MAGENTA}[INVITE]{Style.RESET_ALL} {inviter} invited you to room '{room}' – /accept {room}")
+            elif ptype == ROOM_MSG:                        # Private room chat
+                room, sender, text = pkt["room"], pkt["from"], pkt["text"]
+                tag = "" if room == self.current_room else f"[{room}] "
+                colour = Fore.YELLOW if room == self.current_room else Fore.BLUE
+                print(f"\r{colour}{tag}<{sender}>{Style.RESET_ALL} {text}")
+            # Prompt re‑paint so the user's current input line isn't lost
+            print()
+            sys.stdout.write(self._prompt())
+            sys.stdout.flush()
+
+    def _handle_command(self, line: str) -> None:
+        try:
+            cmd, *args = shlex.split(line)
+        except ValueError as exc:
+            print(f"Parse error: {exc}")
+            return
+        
+        match cmd.lower():
+            case "/create":
+                if len(args) != 1:
+                    print("Usage: /Create <room>")
+                    return
+                room = args[0]
+                self._send(make_packet(CREATE_ROOM, name=self.name, room=room))
+                self.rooms.add(room)
+                self.current_room = room
+
+            case "/invite":
+                if len(args) != 2:
+                    print("Usage: /invite <room> <user>")
+                    return
+                room, user = args
+                self._send(make_packet(INVITE, room=room, **{"from": self.name}, to=user))
+
+            case "/accept":
+                if len(args) != 1:
+                    print("Using: /accept <room>")
+                    return
+                room = args[0]
+                if room not in self.pending_inv:
+                    print(f"No pending invite for '{room}'")
+                    return
+                
+
+
+
+                #!/usr/bin/env python3
+"""Simple *stateless* UDP server managing:
+
+* Public lobby broadcasting
+* Private rooms (membership tracking + invitation workflow)
+* No persistence – everything lives in RAM until process exits.
+"""
+
+from __future__ import annotations
+
+import argparse                       # CLI parsing
+import json                           # For packet decode
+import queue                          # Thread‑safe FIFO between recv‑thread & main
+import socket                         # UDP socket operations
+import threading                      # Concurrency primitives
+from typing import Dict, Set, Tuple   # Typing helpers
+
+from .protocol import (
+    ACCEPT_INV, BUF_SIZE, CREATE_ROOM, DEFAULT_PORT, INVITE, JOIN, PUBLIC_MSG,
+    QUIT, ROOM_MSG, SYSTEM_MSG, ClientInfo, make_packet, parse_packet,
+)
+from .util import LOG, get_local_ip
+from .packet_spec import EXPECTED_FIELDS_BY_TYPE
+
+
+class UDPChatServer:
+    """Event‑driven UDP server / message router."""
+
+    def __init__(self, host: str, port: int = DEFAULT_PORT) -> None:
+        # Listening endpoint (0.0.0.0 allowed if host passed accordingly)
+        self.host = host
+        self.port = port
+
+        # ------ bind socket ------
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self.host, self.port))
+
+        # ------ runtime state ------
+        self.clients: Dict[Tuple[str, int], ClientInfo] = {}   # addr ➜ info
+        self.rooms: Dict[str, Set[Tuple[str, int]]] = {}       # room ➜ set(addr)
+        self.pending_inv: Dict[Tuple[str, int], Set[str]] = {} # addr ➜ invited rooms
+
+        # Thread‑safe queue: recv‑thread pushes datagrams, main thread pops.
+        self.recv_q: "queue.Queue[Tuple[bytes, Tuple[str, int]]]" = queue.Queue()
+
+        # Flag to shut all loops down cooperatively.
+        self.running = threading.Event()
+        self.running.set()
+
+    def start(self) -> None:
+        LOG.info("Server listening on %s:%d", self.host, self.port)
+        threading.Thread(target=self._recv_loop, daemon=True).start()
+        try:
+            self._process_loop()
+        except KeyboardInterrupt:
+            LOG.info("Shutdown requested")
+        finally:
+            self.running.clear()
+            self.sock.close()
+
+    def _recv_loop(self) -> None:
+        while self.running.is_set():
+            try:
+                data, addr = self.sock.recvfrom(BUF_SIZE)
+                self.recv_q.put((data, addr))
+            except OSError:
+                break
+
+    def _send(self, pkt: bytes, addr: Tuple[str, int]) -> None:
+        try:
+            self.sock.sendto(pkt, addr)
+        except OSError:
+            self._disconnect(addr)
+
+    def _broadcast(self, pkt: bytes, exclude: Tuple[str, int] | None = None) -> None:
+        for a in list(self.clients):
+            if a != exclude:
+                self._send(pkt, a)
+            
+    def _disconnect(self, addr: Tuple[str, int]) -> None:
+        Client = self.clients.pop(addr, None)
+        if not Client:
+            return
+        

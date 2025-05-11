@@ -142,6 +142,7 @@ class UDPChatServer:
     def _handle_public(self, pkt: dict, addr: Tuple[str, int]) -> None:
         client = self.clients.get(addr)
         if not client:
+            LOG.warning("Unknown sender %s tried to send public msg", addr)
             return
         text = pkt.get("text", "")
         LOG.info("<%s> %s", client.name, text)
@@ -152,6 +153,7 @@ class UDPChatServer:
         if not room:
             return
         self.rooms.setdefault(room, set()).add(addr)
+        LOG.info("%s created room '%s'", self.clients[addr].name, room)
         self._send(make_packet(SYSTEM_MSG, text=f"Room '{room}' created"), addr)
 
     def _handle_invite(self, pkt: dict, addr: Tuple[str, int]) -> None:
@@ -168,7 +170,7 @@ class UDPChatServer:
 
         # Record pending invitation
         self.pending_inv.setdefault(target_addr, set()).add(room)
-        invite_pkt = make_packet(INVITE, room=room, **{"from": self.clients[addr].name})
+        invite_pkt = make_packet(INVITE, room=room, **{"from": self.clients[addr].name}, to=target_name)
         self._send(invite_pkt, target_addr)
 
     def _handle_accept(self, pkt: dict, addr: Tuple[str, int]) -> None:
