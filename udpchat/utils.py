@@ -1,67 +1,66 @@
 #!/usr/bin/env python3
-"""
-Logging configuration and a utility function to determine the local IP address.
-"""
+"""Logging utils **and** helper that discovers our outward‑facing IP address."""
 
-from __future__ import annotations  # Allows forward references in type annotations
-import logging
-import socket
-import sys
+from __future__ import annotations
+import logging                           # Python stdlib logging framework
+import socket                            # Needed for IP detection
+import sys                               # For stderr/stdout handles
 from logging.handlers import RotatingFileHandler
 
-# Public API of this module
 __all__ = ["LOG", "configure_logging", "get_local_ip"]
 
+# ----------------------------------------------------------------------
+# configure_logging() builds a ready‑to‑use Logger with both console + file
+# output.  We call it *once* (module import time) and keep the singleton in LOG.
+# ----------------------------------------------------------------------
+
 def configure_logging() -> logging.Logger:
-    """
-    Configures a logger named 'udpchat' with both console and file handlers.
-    The file handler uses log rotation to manage log file size.
+    """Return a logger named "udpchat" with sane defaults (INFO level)."""
 
-    Returns:
-        logging.Logger: Configured logger instance.
-    """
-    logger = logging.getLogger("udpchat")
-    logger.setLevel(logging.INFO)  # Set logging level to INFO
+    logger = logging.getLogger("udpchat")   # Create / fetch named logger
+    logger.setLevel(logging.INFO)           # Verbose enough for diagnostics
 
-    # Console output handler
-    sh = logging.StreamHandler(sys.stdout)
+    # ----- Console handler (stdout) -----
+    sh = logging.StreamHandler(sys.stdout)  # Emit human output in foreground
 
-    # Rotating file handler (1MB max per file, keep 3 backups)
+    # ----- Rotating file handler -----
+    # Rotates once file hits ±1 MiB, keeps 3 backups ⇒ log ≲ 4 MiB on disk.
     fh = RotatingFileHandler(
         "udp_chat.log",
-        maxBytes=1_048_576,     # 1 MB
-        backupCount=3,          # Keep last 3 log files
-        encoding="utf-8"
+        maxBytes=1_048_576,
+        backupCount=3,
+        encoding="utf-8",
     )
 
-    # Define a consistent log format for both handlers
+    # Unified log line format.  Example: [23:59:59] INFO     User joined
     fmt = logging.Formatter("[%(asctime)s] %(levelname)-8s %(message)s", "%H:%M:%S")
     sh.setFormatter(fmt)
     fh.setFormatter(fmt)
 
-    # Attach both handlers to the logger
+    # Register both handlers once only.
     logger.addHandler(sh)
     logger.addHandler(fh)
 
     return logger
 
-# Global logger instance used throughout the application
+# Instantiate global logger so that *importers* can simply do:
+#     from udpchat.util import LOG
 LOG = configure_logging()
 
-def get_local_ip() -> str:
-    """
-    Attempts to determine the local IP address of the host.
-    Falls back to '127.0.0.1' if unable to detect.
+# ----------------------------------------------------------------------
+# best‑effort outward IP discovery (no external calls, works offline)
+# ----------------------------------------------------------------------
 
-    Returns:
-        str: Best-effort local IP address.
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def get_local_ip() -> str:
+    """Return the host's primary IP, fallback to 127.0.0.1 on failure."""
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # UDP socket ≠ connect
     try:
-        # Use a dummy connection to a public DNS server to determine the local IP
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]  # Extract local IP from socket
+        # connect() with UDP doesn't actually send packets until sendto(); that's
+        # good: we just want to force the OS to select a source IP for that dest.
+        sock.connect(("8.8.8.8", 80))          # Google DNS (never contacted)
+        return sock.getsockname()[0]            # (<chosen‑ip>, <port>) tuple
     except OSError:
-        return "127.0.0.1"  # Fallback to localhost
+        return "127.0.0.1"                      # Either offline or no NIC
     finally:
-        s.close()  # Ensure socket is always closed
+        sock.close()                            # Always release resources
